@@ -9,14 +9,20 @@ timestamp () {
   date +"%Y-%m-%d %H:%M:%S,%3N"
 }
 
+valheim_pid=""
+shutdown_requested=0
+wait_interrupted=0
 shutdown () {
-    echo ""
-    echo "$(timestamp) INFO: Recieved SIGTERM, shutting down gracefully"
-    kill -2 $valheim_pid
+    shutdown_requested=1
+    wait_interrupted=1
+    if [[ -n "$valheim_pid" ]]; then
+        echo "$(timestamp) INFO: Requesting graceful Valheim shutdown"
+        kill -INT "$valheim_pid" 2>/dev/null || true
+    else
+        echo "$(timestamp) INFO: Shutdown requested during initialization"
+    fi
 }
-
-# Set our trap
-trap 'shutdown' TERM
+trap shutdown TERM INT
 
 echo "Load extra Box64 and Fex-emu settings from emulators.rc"
 source /load_emulators_env.sh
@@ -63,8 +69,9 @@ echo "Load vars for valheim_server.x86_64"
 export DOORSTOP_ENABLED=1
 export DOORSTOP_TARGET_ASSEMBLY=./BepInEx/core/BepInEx.Preloader.dll
 
-export LD_LIBRARY_PATH="./doorstop_libs:$LD_LIBRARY_PATH"
-export LD_LIBRARY_PATH="./linux64:$LD_LIBRARY_PATH"
+# Apply guest library paths only to the server launch.
+guest_library_path="${SERVER}/linux64:${SERVER}/doorstop_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+guest_env="${FEX_ENV:-}"
 ####
 
 echo "Starting server PRESS CTRL-C to exit"
@@ -85,7 +92,17 @@ fi
 sed -i "s/^enabled *=.*/enabled = ${ENABLE_PLUGINS}/" "${SERVER}/doorstop_config.ini"
 if [ "$ENABLE_PLUGINS" = "true" ]; then
     echo "Plugins support is ENABLED"
-    export LD_PRELOAD="libdoorstop_x64.so:$LD_PRELOAD"
+    doorstop_lib="${SERVER}/doorstop_libs/libdoorstop_x64.so"
+    if [[ ! -f "$doorstop_lib" ]]; then
+        echo "$(timestamp) ERROR: Doorstop library missing: $doorstop_lib"
+        exit 1
+    fi
+    # FEX_ENV injects the preload into the x86 guest, not native ARM64 tools.
+    if [[ -n "$guest_env" && "$guest_env" != "LD_PRELOAD=$doorstop_lib" ]]; then
+        echo "$(timestamp) ERROR: Custom FEX_ENV conflicts with Doorstop injection"
+        exit 1
+    fi
+    guest_env="LD_PRELOAD=$doorstop_lib"
 else
     echo "Plugins support is DISABLED"
 fi
@@ -101,7 +118,15 @@ fi
 mkdir -p "${PERSISTENT}/logs"
 LOG_FILE="${PERSISTENT}/logs/valheim_$(date '+%d-%m-%Y').log"
 
-$runx64 ./valheim_server.x86_64 \
+if (( shutdown_requested )); then
+    exit 0
+fi
+# With job control, the asynchronous child does not inherit ignored SIGINT.
+set -m
+exec {log_fd}> >(tee -a "$LOG_FILE")
+log_pid=$!
+FEX_ENV="$guest_env" LD_LIBRARY_PATH="$guest_library_path" \
+    "${runx64:-FEX}" ./valheim_server.x86_64 \
     -name "$SERVER_NAME" \
     -port 2456 \
     -world "$SERVER_WORLD" \
@@ -115,33 +140,25 @@ $runx64 ./valheim_server.x86_64 \
     ${CROSSPLAY_FLAG:+"$CROSSPLAY_FLAG"} \
     -nographics  \
     -batchmode \
-    2>&1 | tee -a ${LOG_FILE} &
-
-#export LD_LIBRARY_PATH=$templdpath
-
-# Find pid for valheim_server
-timeout=0
-while [ $timeout -lt 11 ]; do
-    if ps -e | grep "FEXInterpreter"; then
-        valheim_pid=$(ps -e | grep "FEXInterpreter" | awk '{print $1}')
+    >&"$log_fd" 2>&1 &
+valheim_pid=$!
+exec {log_fd}>&-
+echo "$(timestamp) INFO: Valheim launched (PID ${valheim_pid})"
+if (( shutdown_requested )); then
+    shutdown
+fi
+while :; do
+    wait_interrupted=0
+    wait -f "$valheim_pid"
+    status=$?
+    if (( ! wait_interrupted )); then
         break
-    elif [ $timeout -eq 10 ]; then
-        echo "$(timestamp) ERROR: Timed out waiting for valheim_server to be running"
-        exit 1
     fi
-    sleep 6
-    ((timeout++))
-    echo "$(timestamp) INFO: Waiting for valheim_server to be running"
 done
-
-echo " "
-# Hold us open until we recieve a SIGTERM
-wait
-
-# Handle post SIGTERM from here
-# Hold us open until WSServer-Linux pid closes, indicating full shutdown, then go home
-tail --pid=$valheim_pid -f /dev/null
-
-# o7
-echo "$(timestamp) INFO: Shutdown complete."
-exit 0
+wait "$log_pid" 2>/dev/null || true
+if (( status == 0 )); then
+    echo "$(timestamp) INFO: Shutdown complete."
+else
+    echo "$(timestamp) ERROR: Valheim exited with status ${status}"
+fi
+exit "$status"
